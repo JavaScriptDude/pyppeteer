@@ -1729,11 +1729,13 @@ class ConsoleMessage(object):
         """Timestamp of console write. Returns None date if empty"""
         return self._tstamp
 
-    def toString(self) -> str:
+    def toString(self, base_url: str = None) -> str:
         try:
             _f = self.frame
             if _f and not _f.get('empty', False):
-                call_str = f"{_f.get('url', '-')}:{_f.get('lineNumber', '-')}:{_f.get('columnNumber', '-')} "
+                url = _f.get('url', '-')
+                if base_url: url = url.replace(base_url, "")
+                call_str = f"{url}:{_f.get('lineNumber', '-')}:{_f.get('columnNumber', '-')} "
             else:
                 call_str = ""
             sb = []
@@ -1743,7 +1745,7 @@ class ConsoleMessage(object):
             return '\n'.join(sb)
 
         except Exception as ex:
-            print(f"toString() failed: {ex}")
+            print(f"ConsoleMessage.toString() failed: {ex}")
             
         return "<ConsoleMessage>"
         
