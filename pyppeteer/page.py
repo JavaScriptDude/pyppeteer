@@ -219,7 +219,8 @@ class Page(EventEmitter):
             helper.releaseObject(self._client, arg)
 
         if source != 'worker':
-            self.emit(Page.Events.Console, ConsoleMessage(level, text, _getTopCallFrame(entry.get('stackTrace', None)), event.get('timestamp', -1)))
+            jsFrameInfo = _getTopCallFrame(entry.get('stackTrace', None))
+            self.emit(Page.Events.Console, ConsoleMessage(level, text, None, jsFrameInfo, event.get('timestamp', -1)))
 
     @property
     def mainFrame(self) -> Optional['Frame']:
@@ -690,7 +691,8 @@ function addPageBinding(bindingName) {
         values: List[JSHandle] = []
         for arg in event.get('args', []):
             values.append(self._frameManager.createJSHandle(context, arg))
-        self._addConsoleMessage(event['type'], values, _getTopCallFrame(event.get('stackTrace', None)), event.get('timestamp', -1))
+        jsFrameInfo = _getTopCallFrame(event.get('stackTrace', None))
+        self._addConsoleMessage(event['type'], values, jsFrameInfo, event.get('timestamp', -1))
 
     def _onBindingCalled(self, event: Dict) -> None:
         obj = json.loads(event['payload'])
@@ -1738,13 +1740,10 @@ class ConsoleMessage(object):
             ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')} " if isinstance(self.timestamp, datetime) else ""
             for jsh in self.args:
                 sb.append(f"{ts}{call_str}{jsh._remoteObject.get('value', '-')}")
-
             return '\n'.join(sb)
 
         except Exception as ex:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            sTB = '\n'.join(traceback.format_tb(exc_traceback))
-            print(f"toString() failed: {exc_type}\n - msg: {exc_value}\n stack: {sTB}")
+            print(f"toString() failed: {ex}")
             
         return "<ConsoleMessage>"
         
@@ -1756,4 +1755,5 @@ class ConsoleMessage(object):
 
 def _getTopCallFrame(st: dict) -> dict:
     sf = st.get('callFrames', None) if st else []
-    return (sf[0] if len(sf) > 0 else {'empty': True})
+    return (sf[0].copy() if len(sf) > 0 else {'empty': True})
+    
