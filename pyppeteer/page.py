@@ -11,6 +11,7 @@ import math
 import mimetypes
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
+from datetime import datetime
 
 from pyee import EventEmitter
 from pyppeteer import helper
@@ -218,7 +219,7 @@ class Page(EventEmitter):
             helper.releaseObject(self._client, arg)
 
         if source != 'worker':
-            self.emit(Page.Events.Console, ConsoleMessage(level, text))
+            self.emit(Page.Events.Console, ConsoleMessage(level, text, _getTopCallFrame(entry.get('stackTrace', None)), event.get('timestamp', -1)))
 
     @property
     def mainFrame(self) -> Optional['Frame']:
@@ -689,7 +690,7 @@ function addPageBinding(bindingName) {
         values: List[JSHandle] = []
         for arg in event.get('args', []):
             values.append(self._frameManager.createJSHandle(context, arg))
-        self._addConsoleMessage(event['type'], values)
+        self._addConsoleMessage(event['type'], values, _getTopCallFrame(event.get('stackTrace', None)), event.get('timestamp', -1))
 
     def _onBindingCalled(self, event: Dict) -> None:
         obj = json.loads(event['payload'])
@@ -711,7 +712,7 @@ function addPageBinding(bindingName) {
         except Exception as e:
             helper.debugError(logger, e)
 
-    def _addConsoleMessage(self, type: str, args: List[JSHandle]) -> None:
+    def _addConsoleMessage(self, type: str, args: List[JSHandle], jsFrameInfo: dict, tstamp: float) -> None:
         if not self.listeners(Page.Events.Console):
             for arg in args:
                 self._client._loop.create_task(arg.dispose())
@@ -725,7 +726,7 @@ function addPageBinding(bindingName) {
             else:
                 textTokens.append(str(helper.valueFromRemoteObject(remoteObject)))
 
-        message = ConsoleMessage(type, ' '.join(textTokens), args)
+        message = ConsoleMessage(type, ' '.join(textTokens), args, jsFrameInfo, tstamp)
         self.emit(Page.Events.Console, message)
 
     def _onDialog(self, event: Any) -> None:
@@ -1689,13 +1690,17 @@ class ConsoleMessage(object):
     ConsoleMessage objects are dispatched by page via the ``console`` event.
     """
 
-    def __init__(self, type: str, text: str, args: List[JSHandle] = None) -> None:
+    def __init__(self, type: str, text: str, args: List[JSHandle] = None, jsFrameInfo: dict = None, tstamp: float = -1) -> None:
         #: (str) type of console message
         self._type = type
         #: (str) console message string
         self._text = text
         #: list of JSHandle
         self._args = args if args is not None else []
+        #: (dict) JS Call frame -or- {'empty': True}
+        self._jsFrameInfo = jsFrameInfo
+        #: (float) JS Timestamp
+        self._tstamp = datetime.fromtimestamp(tstamp/1000) if  tstamp and tstamp > 0 else None
 
     @property
     def type(self) -> str:
@@ -1711,3 +1716,44 @@ class ConsoleMessage(object):
     def args(self) -> List[JSHandle]:
         """Return list of args (JSHandle) of this message."""
         return self._args
+
+    @property
+    def frame(self) -> dict:
+        """Details from CallFrame (dict) that invoked JS console."""
+        return self._jsFrameInfo
+
+    @property
+    def timestamp(self) -> datetime:
+        """Timestamp of console write. Returns None date if empty"""
+        return self._tstamp
+
+    def toString(self) -> str:
+        try:
+            _f = self.frame
+            if _f and not _f.get('empty', False):
+                call_str = f"{_f.get('url', '-')}:{_f.get('lineNumber', '-')}:{_f.get('columnNumber', '-')} "
+            else:
+                call_str = ""
+            sb = []
+            ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')} " if isinstance(self.timestamp, datetime) else ""
+            for jsh in self.args:
+                sb.append(f"{ts}{call_str}{jsh._remoteObject.get('value', '-')}")
+
+            return '\n'.join(sb)
+
+        except Exception as ex:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            sTB = '\n'.join(traceback.format_tb(exc_traceback))
+            print(f"toString() failed: {exc_type}\n - msg: {exc_value}\n stack: {sTB}")
+            
+        return "<ConsoleMessage>"
+        
+
+    def __repr__(self) -> str:
+        return f"<ConsoleMessage> {self.toString()}"
+
+
+
+def _getTopCallFrame(st: dict) -> dict:
+    sf = st.get('callFrames', None) if st else []
+    return (sf[0] if len(sf) > 0 else {'empty': True})
