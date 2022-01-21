@@ -219,8 +219,7 @@ class Page(EventEmitter):
             helper.releaseObject(self._client, arg)
 
         if source != 'worker':
-            jsFrameInfo = _getTopCallFrame(entry.get('stackTrace', None))
-            self.emit(Page.Events.Console, ConsoleMessage(level, text, None, jsFrameInfo, event.get('timestamp', -1)))
+            self.emit(Page.Events.Console, ConsoleMessage(level, text, None, _getLocationFromStacktrace(entry.get('stackTrace', None)), event.get('timestamp', -1)))
 
     @property
     def mainFrame(self) -> Optional['Frame']:
@@ -687,12 +686,28 @@ function addPageBinding(bindingName) {
 
     def _onConsoleAPI(self, event: dict) -> None:
         _id = event['executionContextId']
+        
+        if _id == 0:
+            # DevTools protocol stores the last 1000 console messages. These
+            # messages are always reported even for removed execution contexts. In
+            # this case, they are marked with executionContextId = 0 and are
+            # reported upon enabling Runtime agent.
+            #
+            # Ignore these messages since:
+            # - there's no execution context we can use to operate with message
+            #   arguments
+            # - these messages are reported before Puppeteer clients can subscribe
+            #   to the 'console'
+            #   page event.
+            #
+            # @see https://github.com/puppeteer/puppeteer/issues/3865
+            return
+
         context = self._frameManager.executionContextById(_id)
         values: List[JSHandle] = []
         for arg in event.get('args', []):
             values.append(self._frameManager.createJSHandle(context, arg))
-        jsFrameInfo = _getTopCallFrame(event.get('stackTrace', None))
-        self._addConsoleMessage(event['type'], values, jsFrameInfo, event.get('timestamp', -1))
+        self._addConsoleMessage(event['type'], values, event.get('stackTrace', None), event.get('timestamp', -1))
 
     def _onBindingCalled(self, event: Dict) -> None:
         obj = json.loads(event['payload'])
@@ -714,7 +729,7 @@ function addPageBinding(bindingName) {
         except Exception as e:
             helper.debugError(logger, e)
 
-    def _addConsoleMessage(self, type: str, args: List[JSHandle], jsFrameInfo: dict, tstamp: float) -> None:
+    def _addConsoleMessage(self, type: str, args: List[JSHandle], stackTrace, tstamp: float) -> None:
         if not self.listeners(Page.Events.Console):
             for arg in args:
                 self._client._loop.create_task(arg.dispose())
@@ -728,7 +743,7 @@ function addPageBinding(bindingName) {
             else:
                 textTokens.append(str(helper.valueFromRemoteObject(remoteObject)))
 
-        message = ConsoleMessage(type, ' '.join(textTokens), args, jsFrameInfo, tstamp)
+        message = ConsoleMessage(type, ' '.join(textTokens), args, _getLocationFromStacktrace(stackTrace), tstamp)
         self.emit(Page.Events.Console, message)
 
     def _onDialog(self, event: Any) -> None:
@@ -1692,15 +1707,15 @@ class ConsoleMessage(object):
     ConsoleMessage objects are dispatched by page via the ``console`` event.
     """
 
-    def __init__(self, type: str, text: str, args: List[JSHandle] = None, jsFrameInfo: dict = None, tstamp: float = -1) -> None:
+    def __init__(self, type: str, text: str, args: List[JSHandle] = None, location: dict = None, tstamp: float = -1) -> None:
         #: (str) type of console message
         self._type = type
         #: (str) console message string
         self._text = text
         #: list of JSHandle
         self._args = args if args is not None else []
-        #: (dict) JS Call frame -or- {'empty': True}
-        self._jsFrameInfo = jsFrameInfo
+        #: (dict) JS Console Caller info
+        self._location = location
         #: (float) JS Timestamp
         self._tstamp = datetime.fromtimestamp(tstamp/1000) if  tstamp and tstamp > 0 else None
 
@@ -1720,9 +1735,9 @@ class ConsoleMessage(object):
         return self._args
 
     @property
-    def frame(self) -> dict:
-        """Details from CallFrame (dict) that invoked JS console."""
-        return self._jsFrameInfo
+    def location(self) -> dict:
+        """dict of url, line, column that invoked JS console."""
+        return self._location
 
     @property
     def timestamp(self) -> datetime:
@@ -1731,14 +1746,14 @@ class ConsoleMessage(object):
 
     def toString(self, url_fixer: types.FunctionType = None) -> str:
         try:
-            _f = self.frame
-            if _f and not _f.get('empty', False):
-                url = _f.get('url', '-')
+            _l = self.location
+            if _l and not _l.get('empty', False):
+                url = _l.get('url', '-')
                 try:
                     if url_fixer: url = url_fixer(url)
                 except:
                     pass
-                call_str = f"{url}:{_f.get('lineNumber', '-')}:{_f.get('columnNumber', '-')} "
+                call_str = f"{url}:{_l.get('lineNumber', '-')}:{_l.get('columnNumber', '-')} "
             else:
                 call_str = ""
             sb = []
@@ -1757,8 +1772,10 @@ class ConsoleMessage(object):
         return f"<ConsoleMessage> {self.toString()}"
 
 
-
-def _getTopCallFrame(st: dict) -> dict:
-    sf = st.get('callFrames', None) if st else []
-    return (sf[0].copy() if len(sf) > 0 else {'empty': True})
-    
+def _getLocationFromStacktrace(stackTrace: dict) -> dict:
+    sf = stackTrace.get('callFrames', None) if stackTrace else None
+    return {} if not sf or len(sf) < 1 else {
+        "url": sf[0].get('url', '-'),
+        "lineNumber": sf[0].get('lineNumber', '-'),
+        "columnNumber": sf[0].get('columnNumber', '-')
+    }
