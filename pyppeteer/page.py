@@ -10,7 +10,7 @@ import logging
 import math
 import mimetypes
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union, types
 from datetime import datetime
 
 from pyee import EventEmitter
@@ -1729,17 +1729,20 @@ class ConsoleMessage(object):
         """Timestamp of console write. Returns None date if empty"""
         return self._tstamp
 
-    def toString(self, base_url: str = None) -> str:
+    def toString(self, url_fixer: types.FunctionType = None) -> str:
         try:
             _f = self.frame
             if _f and not _f.get('empty', False):
                 url = _f.get('url', '-')
-                if base_url: url = url.replace(base_url, "")
+                try:
+                    if url_fixer: url = url_fixer(url)
+                except:
+                    pass
                 call_str = f"{url}:{_f.get('lineNumber', '-')}:{_f.get('columnNumber', '-')} "
             else:
                 call_str = ""
             sb = []
-            ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')} " if isinstance(self.timestamp, datetime) else ""
+            ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')[:17]} " if isinstance(self.timestamp, datetime) else ""
             for jsh in self.args:
                 sb.append(f"{ts}{call_str}{jsh._remoteObject.get('value', '-')}")
             return '\n'.join(sb)
