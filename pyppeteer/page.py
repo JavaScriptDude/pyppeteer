@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import mimetypes
+import pprint
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union, types
 from datetime import datetime
@@ -210,16 +211,19 @@ class Page(EventEmitter):
         self.emit('error', PageError('Page crashed!'))
 
     def _onLogEntryAdded(self, event: Dict) -> None:
-        entry = event.get('entry', {})
-        level = entry.get('level', '')
-        text = entry.get('text', '')
-        args = entry.get('args', [])
-        source = entry.get('source', '')
-        for arg in args:
-            helper.releaseObject(self._client, arg)
+        try:
+            entry = event.get('entry', {})
+            level = entry.get('level', '')
+            text = entry.get('text', '')
+            args = entry.get('args', [])
+            source = entry.get('source', '')
+            for arg in args:
+                helper.releaseObject(self._client, arg)
 
-        if source != 'worker':
-            self.emit(Page.Events.Console, ConsoleMessage(level, text, None, _getLocationFromStacktrace(entry.get('stackTrace', None)), event.get('timestamp', -1)))
+            if source != 'worker':
+                self.emit(Page.Events.Console, ConsoleMessage(level, text, None, _getLocationFromStacktrace(entry.get('stackTrace', None)), event.get('timestamp', -1)))
+        except Exception as e:
+            debugError(logger, e)
 
     @property
     def mainFrame(self) -> Optional['Frame']:
@@ -685,29 +689,32 @@ function addPageBinding(bindingName) {
         self.emit(Page.Events.PageError, PageError(message))
 
     def _onConsoleAPI(self, event: dict) -> None:
-        _id = event['executionContextId']
-        
-        if _id == 0:
-            # DevTools protocol stores the last 1000 console messages. These
-            # messages are always reported even for removed execution contexts. In
-            # this case, they are marked with executionContextId = 0 and are
-            # reported upon enabling Runtime agent.
-            #
-            # Ignore these messages since:
-            # - there's no execution context we can use to operate with message
-            #   arguments
-            # - these messages are reported before Puppeteer clients can subscribe
-            #   to the 'console'
-            #   page event.
-            #
-            # @see https://github.com/puppeteer/puppeteer/issues/3865
-            return
+        try:
+            _id = event['executionContextId']
+            
+            if _id == 0:
+                # DevTools protocol stores the last 1000 console messages. These
+                # messages are always reported even for removed execution contexts. In
+                # this case, they are marked with executionContextId = 0 and are
+                # reported upon enabling Runtime agent.
+                #
+                # Ignore these messages since:
+                # - there's no execution context we can use to operate with message
+                #   arguments
+                # - these messages are reported before Puppeteer clients can subscribe
+                #   to the 'console'
+                #   page event.
+                #
+                # @see https://github.com/puppeteer/puppeteer/issues/3865
+                return
 
-        context = self._frameManager.executionContextById(_id)
-        values: List[JSHandle] = []
-        for arg in event.get('args', []):
-            values.append(self._frameManager.createJSHandle(context, arg))
-        self._addConsoleMessage(event['type'], values, event.get('stackTrace', None), event.get('timestamp', -1))
+            context = self._frameManager.executionContextById(_id)
+            values: List[JSHandle] = []
+            for arg in event.get('args', []):
+                values.append(self._frameManager.createJSHandle(context, arg))
+            self._addConsoleMessage(event['type'], values, event.get('stackTrace', None), event.get('timestamp', -1))
+        except Exception as e:
+            debugError(logger, e)
 
     def _onBindingCalled(self, event: Dict) -> None:
         obj = json.loads(event['payload'])
@@ -1744,7 +1751,7 @@ class ConsoleMessage(object):
         """Timestamp of console write. Returns None date if empty"""
         return self._tstamp
 
-    def toString(self, url_fixer: types.FunctionType = None) -> str:
+    def toString(self, url_fixer: types.FunctionType = None, dumper: types.FunctionType = None) -> str:
         try:
             _l = self.location
             if _l and not _l.get('empty', False):
@@ -1756,17 +1763,40 @@ class ConsoleMessage(object):
                 call_str = f"{url}:{_l.get('lineNumber', '-')}:{_l.get('columnNumber', '-')} "
             else:
                 call_str = ""
-            sb = []
+            a = []
             ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')[:17]} " if isinstance(self.timestamp, datetime) else ""
+
             for jsh in self.args:
-                sb.append(f"{ts}{call_str}{jsh._remoteObject.get('value', '-')}")
-            return '\n'.join(sb)
+                _ro = jsh._remoteObject
+                (_type, _subType, _data) = _simplifyRemoteObject(self.type, jsh._remoteObject)
+
+                # Try calling user defined dumper
+                _msg = self._call_dumper(dumper, _type, _subType, _data) if dumper else None
+
+                # Stringify if None
+                try:
+                    _msg = _stringifyRemoteObject(_type, _subType, _data) if _msg is None else _msg
+                except Exception as ex:
+                    _msg = f"_stringifyRemoteObject() Failed on console type: {self.type} remoteObject: {_ro} ex: {ex.args}"
+                    
+
+                a.append(f"{ts}[{self.type}] {call_str}{_msg}")
+
+            return '\n'.join(a)
 
         except Exception as ex:
-            print(f"ConsoleMessage.toString() failed: {ex}")
+            debugError(logger, "ConsoleMessage.toString() failed")
+            debugError(logger, ex)
             
         return "<ConsoleMessage>"
         
+
+    def _call_dumper(self, h, _type, _subType, _data):
+        try:
+            return h(self, _type, _subType, _data)
+        except:
+            pass
+        return "-"
 
     def __repr__(self) -> str:
         return f"<ConsoleMessage> {self.toString()}"
@@ -1779,3 +1809,64 @@ def _getLocationFromStacktrace(stackTrace: dict) -> dict:
         "lineNumber": sf[0].get('lineNumber', '-'),
         "columnNumber": sf[0].get('columnNumber', '-')
     }
+
+
+# Serializes type and data from remote object as tuple of (_type, _subType, _data)
+# For ones it can't figure out, it returns _subType of 'unknown' and remoteObject as _data
+def _simplifyRemoteObject(logType: str, remoteObject: dict) -> dict:
+    _type = remoteObject.get('type', None)
+    
+    if logType == 'table':
+        _subType = remoteObject.get('className', None)
+        if _subType == 'Array' or _subType == 'Object':
+            _data = [] if _subType == 'Array' else {}
+            for _prop in remoteObject.get('preview', {}).get('properties', []):
+                if _subType == 'Array':
+                    _data.append([_vpp.get('value', None) for _vpp in _prop.get('valuePreview', {}).get('properties', []) if 1])
+                elif _subType == 'Object':
+                    _name = _prop.get('name', None)
+                    if not _name is None:
+                        _data[_name] = _prop.get('value', None)
+
+            return ('table', None, _data)
+
+
+    if _type == 'undefined': return ('undefined', None, None)
+    if _type == 'function' or _type == 'symbol': return (_type, None, remoteObject.get('description', "-"))
+
+    if _type == 'object':
+        _subType = remoteObject.get('subtype', '-')
+        if _subType == 'date':
+            return (_type, _subType, remoteObject.get('description', "-"))
+
+        elif _subType == 'null':
+            return ('null', None, None)
+            
+        else:
+            _className = remoteObject.get('className', '-')
+            return (_type, _className, remoteObject.get('preview', {}).get('properties', None))
+
+    else:
+        _data = remoteObject.get('value', None)
+        if _data is None: 
+            _data = remoteObject.get('unserializableValue', None)
+            if not _data is None: return (_type, "unserializable", _data)
+
+        if not _data is None: return (_type, None, _data)
+
+    return (_type, "unknown", remoteObject)
+
+
+def _stringifyRemoteObject(_type: str, _subType: str, _data: Any) -> dict:
+    if _type == 'table': return f"[console.table]:\n{pprint.PrettyPrinter(indent=2).pformat(_data)}"
+    if _type == 'function' or _type == 'symbol': return _data
+    if _type == 'bigint': return f"<bigint> {_data}"
+    if _type == 'undefined' or _type == 'null': return f"({_type})"
+    if _type in ['string', 'number', 'boolean']: return _data
+
+    if _type == 'object':
+        if _subType == 'date': return f"<Date> {_data}"
+        if _subType == 'Object': return f"<plain object> ..."
+        return f"<object {_subType.capitalize()}> ..."
+
+    return f"??? <{_type} {_subType}> {_data if _data else '-'}"
