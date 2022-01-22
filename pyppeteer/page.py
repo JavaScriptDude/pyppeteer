@@ -10,8 +10,8 @@ import logging
 import math
 import mimetypes
 import pprint
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union, types
+from types import SimpleNamespace, FunctionType
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
 from datetime import datetime
 
 from pyee import EventEmitter
@@ -1751,7 +1751,7 @@ class ConsoleMessage(object):
         """Timestamp of console write. Returns None date if empty"""
         return self._tstamp
 
-    def toString(self, url_fixer: types.FunctionType = None, dumper: types.FunctionType = None) -> str:
+    def toString(self, url_fixer: FunctionType = None, dumper: FunctionType = None) -> str:
         try:
             _l = self.location
             if _l and not _l.get('empty', False):
