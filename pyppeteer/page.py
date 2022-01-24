@@ -1770,13 +1770,17 @@ class ConsoleMessage(object):
                 (_type, _subType, _data) = self.getData(jsh)
 
                 # Try calling user defined dumper
-                _msg = self._call_dumper(dumper, _type, _subType, _data) if dumper else None
+                if dumper:
+                    try:
+                        _msg = dumper(self, _type, _subType, _data)
+                    except:
+                        _msg = "-"
 
-                # Stringify if None
+                # Stringify if _msg is None
                 try:
                     _msg = _stringifyRemoteObject(_type, _subType, _data) if _msg is None else _msg
                 except Exception as ex:
-                    _msg = f"_stringifyRemoteObject() Failed on console type: {self.type} remoteObject: {_ro} ex: {ex.args}"
+                    _msg = f"_stringifyRemoteObject() Failed on console type: {self.type} remoteObject: {jsh._remoteObject} ex: {ex.args}"
                     
 
                 a.append(f"{ts}[{self.type}] {call_str}{_msg}")
@@ -1789,14 +1793,6 @@ class ConsoleMessage(object):
             
         return "<ConsoleMessage>"
         
-
-    def _call_dumper(self, h, _type, _subType, _data):
-        try:
-            return h(self, _type, _subType, _data)
-        except:
-            pass
-        return "-"
-
 
     # Serializes JSHandle._remoteObject and returns tuple of (_type, _subType, _data)
     # For ones it can't figure out, it returns _subType of 'unknown' and remoteObject as _data
@@ -1819,6 +1815,7 @@ class ConsoleMessage(object):
                 return ('table', None, _data)
 
 
+
         if _type == 'undefined': return ('undefined', None, None)
         if _type == 'function' or _type == 'symbol': return (_type, None, remoteObject.get('description', "-"))
 
@@ -1835,12 +1832,11 @@ class ConsoleMessage(object):
                 return (_type, _className, remoteObject.get('preview', {}).get('properties', None))
 
         else:
-            _data = remoteObject.get('value', None)
-            if _data is None: 
-                _data = remoteObject.get('unserializableValue', None)
-                if not _data is None: return (_type, "unserializable", _data)
-
-            if not _data is None: return (_type, None, _data)
+            try:
+                _data = helper.valueFromRemoteObject(remoteObject)
+                return (_type, None, _data)
+            except helper.ElementHandleError as e:
+                return (_type, "unserializable", remoteObject.get('unserializableValue'))
 
         return (_type, "unknown", remoteObject)
 
