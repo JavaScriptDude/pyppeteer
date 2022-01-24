@@ -22,7 +22,7 @@ Included Changes:
 Added JavaScript call frame details and parsed timestamp to the `ConsoleMessage` object. And exposed toString() api for printing out resuls including stringification.
 
 Eg:
-```
+```python
 # Optionally, alter the URL component of log output
 def _url_fixer(url):
     return url.replace(base_url, "").split('?')[0]
