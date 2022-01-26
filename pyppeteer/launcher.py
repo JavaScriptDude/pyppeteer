@@ -217,7 +217,7 @@ class Launcher(object):
 
         _remUserDD = (self.temporaryUserDataDir and os.path.exists(self.temporaryUserDataDir))
         if _remUserDD or self.waitForBrowserToClose:
-            print("Waiting for Chrome To Close ...")
+            logger.info("Waiting for Chrome To Close ...")
             await self.waitForChromeToClose()
 
         if _remUserDD:  # noqa: E501
