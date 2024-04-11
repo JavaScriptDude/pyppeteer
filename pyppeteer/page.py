@@ -9,8 +9,10 @@ import json
 import logging
 import math
 import mimetypes
-from types import SimpleNamespace
+import pprint
+from types import SimpleNamespace, FunctionType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
+from datetime import datetime
 
 from pyee import EventEmitter
 from pyppeteer import helper
@@ -209,16 +211,19 @@ class Page(EventEmitter):
         self.emit('error', PageError('Page crashed!'))
 
     def _onLogEntryAdded(self, event: Dict) -> None:
-        entry = event.get('entry', {})
-        level = entry.get('level', '')
-        text = entry.get('text', '')
-        args = entry.get('args', [])
-        source = entry.get('source', '')
-        for arg in args:
-            helper.releaseObject(self._client, arg)
+        try:
+            entry = event.get('entry', {})
+            level = entry.get('level', '')
+            text = entry.get('text', '')
+            args = entry.get('args', [])
+            source = entry.get('source', '')
+            for arg in args:
+                helper.releaseObject(self._client, arg)
 
-        if source != 'worker':
-            self.emit(Page.Events.Console, ConsoleMessage(level, text))
+            if source != 'worker':
+                self.emit(Page.Events.Console, ConsoleMessage(level, text, None, _getLocationFromStacktrace(entry.get('stackTrace', None)), event.get('timestamp', -1)))
+        except Exception as e:
+            debugError(logger, e)
 
     @property
     def mainFrame(self) -> Optional['Frame']:
@@ -684,12 +689,32 @@ function addPageBinding(bindingName) {
         self.emit(Page.Events.PageError, PageError(message))
 
     def _onConsoleAPI(self, event: dict) -> None:
-        _id = event['executionContextId']
-        context = self._frameManager.executionContextById(_id)
-        values: List[JSHandle] = []
-        for arg in event.get('args', []):
-            values.append(self._frameManager.createJSHandle(context, arg))
-        self._addConsoleMessage(event['type'], values)
+        try:
+            _id = event['executionContextId']
+            
+            if _id == 0:
+                # DevTools protocol stores the last 1000 console messages. These
+                # messages are always reported even for removed execution contexts. In
+                # this case, they are marked with executionContextId = 0 and are
+                # reported upon enabling Runtime agent.
+                #
+                # Ignore these messages since:
+                # - there's no execution context we can use to operate with message
+                #   arguments
+                # - these messages are reported before Puppeteer clients can subscribe
+                #   to the 'console'
+                #   page event.
+                #
+                # @see https://github.com/puppeteer/puppeteer/issues/3865
+                return
+
+            context = self._frameManager.executionContextById(_id)
+            values: List[JSHandle] = []
+            for arg in event.get('args', []):
+                values.append(self._frameManager.createJSHandle(context, arg))
+            self._addConsoleMessage(event['type'], values, event.get('stackTrace', None), event.get('timestamp', -1))
+        except Exception as e:
+            debugError(logger, e)
 
     def _onBindingCalled(self, event: Dict) -> None:
         obj = json.loads(event['payload'])
@@ -711,7 +736,7 @@ function addPageBinding(bindingName) {
         except Exception as e:
             helper.debugError(logger, e)
 
-    def _addConsoleMessage(self, type: str, args: List[JSHandle]) -> None:
+    def _addConsoleMessage(self, type: str, args: List[JSHandle], stackTrace, tstamp: float) -> None:
         if not self.listeners(Page.Events.Console):
             for arg in args:
                 self._client._loop.create_task(arg.dispose())
@@ -725,7 +750,7 @@ function addPageBinding(bindingName) {
             else:
                 textTokens.append(str(helper.valueFromRemoteObject(remoteObject)))
 
-        message = ConsoleMessage(type, ' '.join(textTokens), args)
+        message = ConsoleMessage(type, ' '.join(textTokens), args, _getLocationFromStacktrace(stackTrace), tstamp)
         self.emit(Page.Events.Console, message)
 
     def _onDialog(self, event: Any) -> None:
@@ -1689,13 +1714,17 @@ class ConsoleMessage(object):
     ConsoleMessage objects are dispatched by page via the ``console`` event.
     """
 
-    def __init__(self, type: str, text: str, args: List[JSHandle] = None) -> None:
+    def __init__(self, type: str, text: str, args: List[JSHandle] = None, location: dict = None, tstamp: float = -1) -> None:
         #: (str) type of console message
         self._type = type
         #: (str) console message string
         self._text = text
         #: list of JSHandle
         self._args = args if args is not None else []
+        #: (dict) JS Console Caller info
+        self._location = location
+        #: (float) JS Timestamp
+        self._tstamp = datetime.fromtimestamp(tstamp/1000) if  tstamp and tstamp > 0 else None
 
     @property
     def type(self) -> str:
@@ -1711,3 +1740,133 @@ class ConsoleMessage(object):
     def args(self) -> List[JSHandle]:
         """Return list of args (JSHandle) of this message."""
         return self._args
+
+    @property
+    def location(self) -> dict:
+        """dict of url, line, column that invoked JS console."""
+        return self._location
+
+    @property
+    def timestamp(self) -> datetime:
+        """Timestamp of console write. Returns None date if empty"""
+        return self._tstamp
+
+    def toString(self, url_fixer: FunctionType = None, dumper: FunctionType = None) -> str:
+        try:
+            _l = self.location
+            if _l and not _l.get('empty', False):
+                url = _l.get('url', '-')
+                try:
+                    if url_fixer: url = url_fixer(url)
+                except:
+                    pass
+                call_str = f"{url}:{_l.get('lineNumber', '-')}:{_l.get('columnNumber', '-')} "
+            else:
+                call_str = ""
+            a = []
+            ts = f"{self.timestamp.strftime('%y%m%d-%H%M%S.%f')[:17]} " if isinstance(self.timestamp, datetime) else ""
+
+            for jsh in self.args:
+                (_type, _subType, _data) = self.getData(jsh)
+
+                # Try calling user defined dumper
+                if dumper:
+                    try:
+                        _msg = dumper(self, _type, _subType, _data)
+                    except:
+                        _msg = "-"
+
+                # Stringify if _msg is None
+                try:
+                    _msg = _stringifyRemoteObject(_type, _subType, _data) if _msg is None else _msg
+                except Exception as ex:
+                    _msg = f"_stringifyRemoteObject() Failed on console type: {self.type} remoteObject: {jsh._remoteObject} ex: {ex.args}"
+                    
+
+                a.append(f"{ts}[{self.type}] {call_str}{_msg}")
+
+            return '\n'.join(a)
+
+        except Exception as ex:
+            debugError(logger, "ConsoleMessage.toString() failed")
+            debugError(logger, ex)
+            
+        return "<ConsoleMessage>"
+        
+
+    # Serializes JSHandle._remoteObject and returns tuple of (_type, _subType, _data)
+    # For ones it can't figure out, it returns _subType of 'unknown' and remoteObject as _data
+    def getData(self, jsh: JSHandle) -> dict:
+        remoteObject: dict = jsh._remoteObject
+        _type = remoteObject.get('type', None)        
+        
+        if self.type == 'table':
+            _subType = remoteObject.get('className', None)
+            if _subType == 'Array' or _subType == 'Object':
+                _data = [] if _subType == 'Array' else {}
+                for _prop in remoteObject.get('preview', {}).get('properties', []):
+                    if _subType == 'Array':
+                        _data.append([_vpp.get('value', None) for _vpp in _prop.get('valuePreview', {}).get('properties', []) if 1])
+                    elif _subType == 'Object':
+                        _name = _prop.get('name', None)
+                        if not _name is None:
+                            _data[_name] = _prop.get('value', None)
+
+                return ('table', None, _data)
+
+
+
+        if _type == 'undefined': return ('undefined', None, None)
+        if _type == 'function' or _type == 'symbol': return (_type, None, remoteObject.get('description', "-"))
+
+        if _type == 'object':
+            _subType = remoteObject.get('subtype', '-')
+            if _subType == 'date':
+                return (_type, _subType, remoteObject.get('description', "-"))
+
+            elif _subType == 'null':
+                return ('null', None, None)
+                
+            else:
+                _className = remoteObject.get('className', '-')
+                return (_type, _className, remoteObject.get('preview', {}).get('properties', None))
+
+        else:
+            try:
+                _data = helper.valueFromRemoteObject(remoteObject)
+                return (_type, None, _data)
+            except helper.ElementHandleError as e:
+                return (_type, "unserializable", remoteObject.get('unserializableValue'))
+
+        return (_type, "unknown", remoteObject)
+
+
+    def __repr__(self) -> str:
+        return f"<ConsoleMessage> {self.toString()}"
+
+
+def _getLocationFromStacktrace(stackTrace: dict) -> dict:
+    sf = stackTrace.get('callFrames', None) if stackTrace else None
+    return {} if not sf or len(sf) < 1 else {
+        "url": sf[0].get('url', '-'),
+        "lineNumber": sf[0].get('lineNumber', '-'),
+        "columnNumber": sf[0].get('columnNumber', '-')
+    }
+
+
+
+
+
+def _stringifyRemoteObject(_type: str, _subType: str, _data: Any) -> dict:
+    if _type == 'table': return f"[console.table]:\n{pprint.PrettyPrinter(indent=2).pformat(_data)}"
+    if _type == 'function' or _type == 'symbol': return _data
+    if _type == 'bigint': return f"<bigint> {_data}"
+    if _type == 'undefined' or _type == 'null': return f"({_type})"
+    if _type in ['string', 'number', 'boolean']: return _data
+
+    if _type == 'object':
+        if _subType == 'date': return f"<Date> {_data}"
+        if _subType == 'Object': return f"<plain object> ..."
+        return f"<object {_subType.capitalize()}> ..."
+
+    return f"??? <{_type} {_subType}> {_data if _data else '-'}"
